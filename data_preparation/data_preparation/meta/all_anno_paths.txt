@@ -1,0 +1,2 @@
+Area_1/tile_1/Annotations
+Area_1/tile_2/Annotations

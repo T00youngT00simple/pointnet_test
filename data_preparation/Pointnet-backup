@@ -7,9 +7,9 @@ from torch.autograd import Variable
 class PointNet(nn.Module):
     def __init__(self):
         super(PointNet, self).__init__()
-        # input: B, 9, N, P
+        # input: B, 6, N, P
 
-        self.conv_1 = nn.Conv2d(4, 64, kernel_size=(1,1), stride=(1,1))   # ZZC    raw=9
+        self.conv_1 = nn.Conv2d(9, 64, kernel_size=(1,1), stride=(1,1))
         # self.bn_1 = nn.BatchNorm2d(64, momentum=0.5)
         self.bn_1 = nn.BatchNorm2d(64)
 
@@ -37,7 +37,7 @@ class PointNet(nn.Module):
 
         self.dp = nn.Dropout(p=0.3)
 
-        self.conv_8 = nn.Conv2d(256, 6, kernel_size=(1,1), stride=(1,1))  # ZZC: Num of categories
+        self.conv_8 = nn.Conv2d(256, 4, kernel_size=(1,1), stride=(1,1))
 
         self.global_conv_1 = nn.Conv2d(1024, 256, kernel_size=(1,1), stride=(1,1))
         # self.globa_bn_1 = nn.BatchNorm2d(256, momentum=0.5)
@@ -53,19 +53,9 @@ class PointNet(nn.Module):
 
     def forward(self, input):
 
-        _, _, point_num, _ = input.size()    # (24,9,4096,1)
+        _, _, point_num, _ = input.size()
 
-        # print('Here')
-        # print(input.size())
-        input_new = torch.transpose(input, 0, 1)    # (9,24,4096,1)
-        # print(input_new.size())
-        input_new = input_new[2:6][:][:][:]  # (4,24,4096,1)
-        # print(input_new.size())
-        input_new = torch.transpose(input_new, 0, 1)  # (24,4,4096,1)
-        # print(input_new.size())
-        # exit()
-
-        conv_1 = self.relu(self.bn_1(self.conv_1(input_new)))
+        conv_1 = self.relu(self.bn_1(self.conv_1(input)))
         conv_2 = self.relu(self.bn_2(self.conv_2(conv_1)))
         conv_3 = self.relu(self.bn_3(self.conv_3(conv_2)))
         conv_4 = self.relu(self.bn_4(self.conv_4(conv_3)))

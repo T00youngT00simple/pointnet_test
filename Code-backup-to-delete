@@ -1,0 +1,1142 @@
+from __future__ import division
+from __future__ import print_function
+
+import numpy as np
+import os
+import sys
+import argparse
+from datetime import datetime
+import h5py
+
+# from tensorboardX import SummaryWriter
+
+import torch
+import torch.nn as nn
+from torch.autograd import Variable
+
+from model.pointnet import PointNet
+from utils.train_utils import ConfusionMatrix, adjust_learning_rate, shuffle_data, getDataFiles
+
+def main():
+    parser = argparse.ArgumentParser(description='Voxelnet for semantic')
+    parser.add_argument('--lr', default=0.001, type=float, help='Initial learning rate')   # default=0.001(good)
+    parser.add_argument('--epochs', default=90, help='epochs')   # default=100, 50, 30
+    parser.add_argument('--batchsize', default=24, help='epochs')   # default=32
+    parser.add_argument('--weight_file', default='log_ptn/train/Area_2_2019-08-15-18-29-19/checkpoint/checkpoint_69_max_mIoU_test_66.31549855647624.pth.tar', help='weights to load')
+    # log_ptn/train/Area_2_2019-08-15-16-59-14/checkpoint/checkpoint_0_max_mIoU_test_51.07014771128727.pth.tar
+    parser.add_argument('--test_area', type=int, default=2, help='Which area to use for test, option: 1-2 [default: 2]')
+    parser.add_argument('--num_point', type=int, default=4096, help='Point number [default: 4096]')
+
+    args = parser.parse_args()
+    NUM_POINT = args.num_point
+    BATCH_SIZE = args.batchsize
+    lr = args.lr
+    ALL_FILES = getDataFiles('indoor3d_sem_seg_hdf5_data/all_files.txt')  # .h5 file routes
+    room_filelist = [line.rstrip() for line in open('indoor3d_sem_seg_hdf5_data/room_filelist.txt')]
+
+    # Load ALL data into a big data_batch & a big label_batch
+    data_batch_list = []
+    label_batch_list = []
+    print(ALL_FILES)
+    for h5_filename in ALL_FILES:
+        h5_dir = os.path.join('/home/zhenchao/pointnet_pytorch-master/indoor3d_sem_seg_hdf5_data',h5_filename)
+        f = h5py.File(h5_dir)
+        data_batch = f['data'][:]
+        label_batch = f['label'][:]
+
+        data_batch_list.append(data_batch)
+        label_batch_list.append(label_batch)
+    data_batches = np.concatenate(data_batch_list, 0)
+    label_batches = np.concatenate(label_batch_list, 0)
+    print(data_batches.shape)
+    print(label_batches.shape)
+
+    test_area = 'Area_' + str(args.test_area)
+    train_idxs = []
+    test_idxs = []
+    for i, room_name in enumerate(room_filelist):
+        if test_area in room_name:
+            test_idxs.append(i)
+        else:
+            train_idxs.append(i)
+
+    train_data = data_batches[train_idxs, ...]
+    train_label = label_batches[train_idxs].astype(np.int64)
+    # test_data = data_batches[test_idxs, ...]      # ZZC
+    # test_label = label_batches[test_idxs].astype(np.int64)  # ZZC
+
+    test_data = train_data    # ZZC
+    test_label = train_label    # ZZC
+
+    print(train_data.shape, train_label.shape)
+    print(test_data.shape, test_label.shape)
+
+
+    time_string = datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
+    log_dir = os.path.join('log_ptn/train', test_area + '_' + time_string)
+
+    if not os.path.exists(log_dir): os.makedirs(log_dir)
+
+    checkpoint_dir = os.path.join(log_dir, 'checkpoint')
+    if not os.path.exists(checkpoint_dir): os.makedirs(checkpoint_dir)
+
+
+    start_epoch = 0
+    epochs = args.epochs
+
+    model = get_model()
+    model.cuda()
+    # print(model)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr)
+
+    # class_names = ["ground", "vegetation", "building", "clutter"]    # ZZC
+    class_names = ["T2T", "B2B", "BH", "BL", "V2V", "OT"]
+
+    # Add weights to the loss function
+    # weightsTrain = [0.04, 0.20, 0.12, 0.64]  # default
+    # weightsTrain = [0.25, 0.25, 0.25, 0.25]
+    # weightsTrain = [0.20, 0.50, 0.30, 0.50]
+    weightsTrain = [0.2, 0.4, 0.6, 1.00, 1.00, 1.00]
+    class_weights_Train = torch.FloatTensor(weightsTrain).cuda()
+    criterionTrain = nn.CrossEntropyLoss(weight=class_weights_Train,
+                                         size_average=True).cuda()
+     # True: loss is averaged over each loss element in batch
+    weightsVal = [0.2, 0.4, 0.6, 1.00, 1.00, 1.00]    # default  [0.08, 0.37, 0.15, 0.40]
+    class_weights_Val = torch.FloatTensor(weightsVal).cuda()
+    criterionVal = nn.CrossEntropyLoss(weight=class_weights_Val,
+                                         size_average=True).cuda()
+
+    if args.weight_file != '':
+        pre_trained_model = torch.load(args.weight_file)
+        start_epoch = pre_trained_model['epoch']
+        model_state = model.state_dict()
+        model_state.update(pre_trained_model['state_dict'])
+        model.load_state_dict(model_state)
+
+
+    #  #####################################################
+    #    Start training
+    #  #####################################################
+    global_counter = 0
+    max_mIoU_test = 0.0
+
+    for epoch in range(start_epoch, epochs):
+        learn_rate_now = adjust_learning_rate(optimizer, global_counter, BATCH_SIZE, lr)  # Seems not changing, ZZC
+
+        iter_loss = 0.0  # Initialisation: loss for one epoch
+        iterations = 0
+
+        cm = ConfusionMatrix(6, class_names=class_names)
+        cm.clear()
+
+        model.train()
+
+        train_data_shuffled, train_label_shuffled, _ = shuffle_data(train_data[:, 0:NUM_POINT, :], train_label)
+        file_size = train_data_shuffled.shape[0]  # total number of training batches
+        num_batches = file_size // BATCH_SIZE  # number of iterations in one epoch
+        print('\nnum_batches(training):\t',num_batches)
+
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * BATCH_SIZE
+            end_idx = (batch_idx + 1) * BATCH_SIZE
+
+            feature = train_data_shuffled[start_idx:end_idx, :, :]
+            label = train_label_shuffled[start_idx:end_idx]
+            # print('Here')
+            # print(feature.shape)
+            # print(label.shape)
+
+            # feature[:, :, 0:2] = 0.0
+            # feature[:, :, 6:9] = 0.0
+            # print(feature.shape)
+
+            # print(feature[0, 0, 0])
+            # print(feature[0, 0, 1])
+            # print(feature[0, 0, 2])
+            # print(feature[0, 0, 3])
+            # print(feature[0, 0, 4])
+            # print(feature[0, 0, 5])
+            # print(feature[0, 0, 6])
+            # print(feature[0, 0, 7])
+            # print(feature[0, 0, 8])
+
+            #
+
+            feature = np.expand_dims(feature, axis=1)
+            input = Variable(torch.from_numpy(feature).cuda(), requires_grad=True)
+            # print(input.size())
+
+            input = torch.transpose(input, 3, 1)   # ? ZZC
+            # print(input.size())
+
+            target = Variable(torch.from_numpy(label).cuda(), requires_grad=False)
+            # print(target.size())
+
+            target = target.view(-1,)
+            # print(target.size())
+
+            output = model(input)
+            output_reshaped = output.permute(0, 3, 2, 1).contiguous().view(-1, 4)
+
+            # exit()  # for check, ZZC
+            _, pred = torch.max(output.data, 1)
+            pred = pred.view(-1,)
+            cm.add_batch(target.cpu().numpy(), pred.cpu().numpy())  # detach()
+            loss = criterionTrain(output_reshaped, target)
+            iter_loss += loss.item()  # Accumulate the loss
+            iterations +=1
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            global_counter += 1
+
+            if batch_idx%10==0:
+                print('Epoch: [%3d][%3d]\t Loss: %.4f'%(epoch,batch_idx,loss))   # Print loss for one bath
+
+        # Print training results for 1 epoch
+        iou0,iou1,iou2,iou3,mIoU = cm.class_IoU()
+        print('Epoch: [%3d]\t Train Loss: %.4f\t OA: %3.2f%%\t mIoU : %3.2f%%'%(epoch,iter_loss/iterations,cm.overall_accuracy(), mIoU))   # Print loss for the epoch
+        print('ground: %3.2f%%, vegetation: %3.2f%%, building: %3.2f%%, clutter: %3.2f%%'%(iou0,iou1,iou2,iou3))
+
+        with open(os.path.join(log_dir, 'train_log.txt'), 'a') as f:
+            f.write('Epoch: [%3d]\t Train Loss: %.4f\t OA: %3.2f%%\t mIoU : %3.2f%%\n'%(epoch,iter_loss/iterations,cm.overall_accuracy(), mIoU))
+            f.write('ground: %3.2f%%, vegetation: %3.2f%%, building: %3.2f%%, clutter: %3.2f%%\n\n'%(iou0,iou1,iou2,iou3))
+
+
+        #  #####################################################
+        #    Start validation
+        #  #####################################################
+        model.eval()
+        iter_loss = 0.0  # Initialisation: loss for one epoch
+        iterations = 0
+        cm = ConfusionMatrix(4, class_names=class_names)
+        cm.clear()
+
+        file_size = test_data.shape[0]
+        num_batches = file_size // BATCH_SIZE
+        print('num_batches(testing):\t',num_batches)
+
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * BATCH_SIZE
+            end_idx = (batch_idx + 1) * BATCH_SIZE
+            feature = test_data[start_idx:end_idx, :, :]
+            label = test_label[start_idx:end_idx]
+
+            # feature[:, :, 0:2] = 0.0
+            # feature[:, :, 6:9] = 0.0
+
+            feature = np.expand_dims(feature, axis=1)
+            input = Variable(torch.from_numpy(feature).cuda(), requires_grad=True)
+            input = torch.transpose(input, 3, 1)   # ? ZZC
+            target = Variable(torch.from_numpy(label).cuda(), requires_grad=False)
+            target = target.view(-1,)
+            output = model(input)
+            output_reshaped = output.permute(0, 3, 2, 1).contiguous().view(-1, 4)
+
+            _, pred = torch.max(output.data, 1)
+            pred = pred.view(-1,)
+            cm.add_batch(target.cpu().numpy(), pred.cpu().numpy())  # detach()
+
+            loss = criterionVal(output_reshaped, target)
+            iter_loss += loss.item()  # Accumulate the loss
+            iterations +=1
+
+        # Print validation results after 1 epoch
+        iou0, iou1, iou2, iou3, mIoU = cm.class_IoU()
+        print('Epoch: [%3d]\t Test Loss: %.4f\t OA: %3.2f%%\t mIoU : %3.2f%%'%(epoch,iter_loss/iterations,cm.overall_accuracy(), mIoU))   # Print loss for the epoch
+        print('ground: %3.2f%%, vegetation: %3.2f%%, building: %3.2f%%, clutter: %3.2f%%' % (iou0, iou1, iou2, iou3))
+
+        with open(os.path.join(log_dir, 'test_log.txt'), 'a') as f:
+            f.write('Epoch: [%3d]\t Test Loss: %.4f\t OA: %3.2f%%\t mIoU : %3.2f%%\n' % (epoch, iter_loss / iterations,cm.overall_accuracy(), mIoU))
+            f.write('ground: %3.2f%%, vegetation: %3.2f%%, building: %3.2f%%, clutter: %3.2f%%\n\n' % (iou0, iou1, iou2, iou3))
+
+        # Check whether best model, -> Save model
+        if (mIoU > max_mIoU_test or epoch == epochs - 1):
+            max_mIoU_test = mIoU
+            print('-> Best performance (test mIoU) achieved or This is final epoch.')
+            print('Max_mIoU in testing: %3.2f%%\n'%(max_mIoU_test))
+            torch.save(
+                {'epoch': epoch + 1, 'args': args, 'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict()},
+                os.path.join(checkpoint_dir, 'checkpoint_' + str(epoch) + '_max_mIoU_test_' + str(mIoU) + '.pth.tar') )
+
+
+
+def get_model():
+    model = PointNet()
+    print('Total number of parameters: {}'.format(sum([p.numel() for p in model.parameters()])))
+    return model
+
+if __name__ == '__main__':
+    main()
+
+
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd import Variable
+
+class PointNet(nn.Module):
+    def __init__(self):
+        super(PointNet, self).__init__()
+        # input: B, 9, N, P
+
+        self.conv_1 = nn.Conv2d(4, 64, kernel_size=(1,1), stride=(1,1))   # ZZC    raw=9
+        # self.bn_1 = nn.BatchNorm2d(64, momentum=0.5)
+        self.bn_1 = nn.BatchNorm2d(64)
+
+        self.conv_2 = nn.Conv2d(64, 64, kernel_size=(1,1), stride=(1,1))
+        # self.bn_2 = nn.BatchNorm2d(64, momentum=0.5)
+        self.bn_2 = nn.BatchNorm2d(64)
+
+        self.conv_3 = nn.Conv2d(64, 64, kernel_size=(1,1), stride=(1,1))
+        # self.bn_3 = nn.BatchNorm2d(64, momentum=0.5)
+        self.bn_3 = nn.BatchNorm2d(64)
+
+        self.conv_4 = nn.Conv2d(64, 128, kernel_size=(1,1), stride=(1,1))
+        # self.bn_4 = nn.BatchNorm2d(128, momentum=0.5)
+        self.bn_4 = nn.BatchNorm2d(128)
+
+        self.conv_5 = nn.Conv2d(128, 1024, kernel_size=(1,1), stride=(1,1))
+        # self.bn_5 = nn.BatchNorm2d(1024, momentum=0.5)
+        self.bn_5 = nn.BatchNorm2d(1024)
+
+        self.conv_6 = nn.Conv2d(1152, 512, kernel_size=(1,1), stride=(1,1))
+        self.bn_6 = nn.BatchNorm2d(512)
+
+        self.conv_7 = nn.Conv2d(512, 256, kernel_size=(1,1), stride=(1,1))
+        self.bn_7 = nn.BatchNorm2d(256)
+
+        self.dp = nn.Dropout(p=0.3)
+
+        self.conv_8 = nn.Conv2d(256, 4, kernel_size=(1,1), stride=(1,1))
+
+        self.global_conv_1 = nn.Conv2d(1024, 256, kernel_size=(1,1), stride=(1,1))
+        # self.globa_bn_1 = nn.BatchNorm2d(256, momentum=0.5)
+        self.globa_bn_1 = nn.BatchNorm2d(256)
+
+        self.global_conv_2 = nn.Conv2d(256, 128, kernel_size=(1,1), stride=(1,1))
+        # self.globa_bn_2 = nn.BatchNorm2d(128, momentum=0.5)
+        self.globa_bn_2 = nn.BatchNorm2d(128)
+
+        self.relu = nn.ReLU()
+        self.dp = nn.Dropout(p=0.3)
+
+
+    def forward(self, input):
+
+        _, _, point_num, _ = input.size()    # (24,9,4096,1)
+
+        # print('Here')
+        # print(input.size())
+        input_new = torch.transpose(input, 0, 1)    # (9,24,4096,1)
+        # print(input_new.size())
+        input_new = input_new[2:6][:][:][:]  # (4,24,4096,1)
+        # print(input_new.size())
+        input_new = torch.transpose(input_new, 0, 1)  # (24,4,4096,1)
+        # print(input_new.size())
+        # exit()
+
+        conv_1 = self.relu(self.bn_1(self.conv_1(input_new)))
+        conv_2 = self.relu(self.bn_2(self.conv_2(conv_1)))
+        conv_3 = self.relu(self.bn_3(self.conv_3(conv_2)))
+        conv_4 = self.relu(self.bn_4(self.conv_4(conv_3)))
+        conv_5 = self.relu(self.bn_5(self.conv_5(conv_4)))
+
+        global_feature = F.max_pool2d(conv_5, (point_num, 1))
+        global_feature = self.relu(self.globa_bn_1(self.global_conv_1(global_feature)))
+        global_feature = self.relu(self.globa_bn_2(self.global_conv_2(global_feature)))
+        global_feature_repeat = global_feature.repeat(1, 1, point_num, 1)
+
+        points_feat_concat = torch.cat((conv_5, global_feature_repeat), 1)
+
+        conv_6 = self.relu(self.bn_6(self.conv_6(points_feat_concat)))
+        conv_7 = self.relu(self.bn_7(self.conv_7(conv_6)))
+
+        droped = self.dp(conv_7)
+        conv_8 = self.conv_8(droped)
+
+        # conv_2 = self.relu(nn.BatchNorm2d(64, momentum=0.5)(self.conv_2(conv_1)))
+        # conv_3 = self.relu(nn.BatchNorm2d(64, momentum=0.5)(self.conv_3(conv_2)))
+        # conv_4 = self.relu(nn.BatchNorm2d(128, momentum=0.5)(self.conv_4(conv_3)))
+        # conv_5 = self.relu(nn.BatchNorm2d(1024, momentum=0.5)(self.conv_5(conv_4)))
+        #
+        # global_feature = F.max_pool2d(conv_5, (point_num, 1))
+        # global_feature = self.relu(nn.BatchNorm2d(256, momentum=0.5)(self.global_conv_1(global_feature)))
+        # global_feature = self.relu(nn.BatchNorm2d(128, momentum=0.5)(self.global_conv_2(global_feature)))
+        # global_feature_repeat = global_feature.repeat(1, 1, point_num, 1)
+        #
+        # points_feat_concat = torch.cat((conv_5, global_feature_repeat), 1)
+        #
+        # conv_6 = self.relu(nn.BatchNorm2d(512, momentum=0.5)(self.conv_6(points_feat_concat)))
+        # conv_7 = self.relu(nn.BatchNorm2d(256, momentum=0.5)(self.conv_7(conv_6)))
+
+
+        return conv_8
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+from __future__ import division
+from __future__ import print_function
+
+import numpy as np
+import os
+import sys
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(BASE_DIR)
+import argparse
+from datetime import datetime
+
+import torch
+import torch.nn as nn
+from torch.autograd import Variable
+
+from model.pointnet import PointNet
+# from utils.train_utils import AverageMeter, accuracy
+from utils.indoor3d_util import room2blocks_wrapper_normalized, g_label2color
+from utils.train_utils import ConfusionMatrix
+
+parser = argparse.ArgumentParser(description='Voxelnet for semantic')
+parser.add_argument('--batchsize', default=24, help='batchsize')
+parser.add_argument('--weight_file', default='log_ptn/train/Area_2_2019-08-15-15-22-12/checkpoint/checkpoint_58_max_mIoU_test_65.0961691567824.pth.tar', help='weights to load')
+parser.add_argument('--test_area', type=int, default=2, help='Which area to use for test, option: 1-6 [default: 6]')
+parser.add_argument('--num_point', type=int, default=4096, help='Point number [default: 4096]')
+parser.add_argument('--room_data_filelist', default='data_preparation/meta/area2_data_label.txt', help='TXT filename, filelist, each line is a test room data-label file.')
+parser.add_argument('--output_filelist', default='result/output_filelist.txt', help='TXT filename, filelist, each line is an output for a room')
+parser.add_argument('--dump_dir', default='result/dump', help='dump folder path')
+parser.add_argument('--visu', default=True, help='Whether to output OBJ file for prediction visualization.')
+class_names = ["ground", "vegetation", "building", "clutter"]
+
+args = parser.parse_args()
+
+time_string = datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
+log_dir = os.path.join('log_ptn/inference', time_string)
+if not os.path.exists(log_dir): os.makedirs(log_dir)
+
+NUM_POINT = args.num_point
+BATCH_SIZE = args.batchsize
+ROOM_PATH_LIST = [os.path.join(BASE_DIR + '/data_preparation/s3dis_npy', line.rstrip()) for line in open(args.room_data_filelist)]
+DUMP_DIR = args.dump_dir
+DUMP_DIR = os.path.join(log_dir, DUMP_DIR)
+if not os.path.exists(DUMP_DIR): os.makedirs(DUMP_DIR)
+OUTPUT_FILELIST = os.path.join(log_dir,args.output_filelist)
+NUM_CLASSES = 4
+
+def get_model():
+    model = PointNet()
+    print('Total number of parameters: {}'.format(sum([p.numel() for p in model.parameters()])))
+    return model
+
+def evaluate(room_path, out_data_label_filename, out_gt_label_filename):
+    total_correct = 0
+    total_seen = 0
+    total_seen_class = [0 for _ in range(NUM_CLASSES)]
+    total_correct_class = [0 for _ in range(NUM_CLASSES)]
+    if args.visu:
+        fout = open(os.path.join(DUMP_DIR, os.path.basename(room_path)[:-4] + '_pred.obj'), 'w')
+        fout_gt = open(os.path.join(DUMP_DIR, os.path.basename(room_path)[:-4] + '_gt.obj'), 'w')
+    fout_data_label = open(out_data_label_filename, 'w')
+    fout_gt_label = open(out_gt_label_filename, 'w')
+
+    print('Start converting data from .npy to .h5...')
+
+    current_data, current_label = room2blocks_wrapper_normalized(room_path, NUM_POINT,block_size=50.0, stride=10.0,
+                                                 random_sample=False, sample_num=None)
+
+    print('Conversion is finished.')
+
+    #  Returns:
+    #    block_datas: K x num_point x 9 np array of XYZRGB000, RGB is in [0,1]
+    #    block_labels: K x num_point x 1 np array of uint8 labels
+    #    Note that the data (X, Y) have been shifted (min point is origin) and aligned
+
+    current_data = current_data[:, 0:NUM_POINT, :].astype(np.float32)
+    current_label = np.squeeze(current_label).astype(np.int64)
+
+    file_size = current_data.shape[0]   # number of blocks
+    num_batches = file_size // BATCH_SIZE
+
+    print(num_batches)
+
+    for batch_idx in range(num_batches):
+        print(batch_idx)
+        start_idx = batch_idx * BATCH_SIZE
+        end_idx = (batch_idx + 1) * BATCH_SIZE
+        cur_batch_size = end_idx - start_idx
+
+        feature = current_data[start_idx:end_idx, :, :]   # Note .copy()
+        label = current_label[start_idx:end_idx]
+
+        # feature2 = feature.copy()
+        # feature[:, :, 0:2] = 0.0
+        # feature[:, :, 6:9] = 0.0
+
+        feature = np.expand_dims(feature, axis=1)
+        input = Variable(torch.from_numpy(feature).cuda(), requires_grad=True)
+        input = torch.transpose(input, 3, 1)
+        target = Variable(torch.from_numpy(label).cuda(), requires_grad=False)
+        target = target.view(-1,)
+        output = model(input)
+        output_reshaped = output.permute(0, 3, 2, 1).contiguous().view(-1, 4)
+
+        pred_label = np.reshape(np.argmax(output_reshaped.data.cpu().numpy(), axis=1), (BATCH_SIZE,-1))
+        pred_val = np.reshape(output_reshaped.data.cpu().numpy(), (BATCH_SIZE,-1,4))
+
+        # Save prediction labels to OBJ file
+        for b in range(BATCH_SIZE):
+            pts = current_data[start_idx + b, :, :]
+            l = current_label[start_idx + b, :]
+            pred = pred_label[b, :]
+            for i in range(NUM_POINT):
+                color = g_label2color[pred[i]]
+                color_gt = g_label2color[current_label[start_idx + b, i]]
+                if args.visu:
+                    fout.write(
+                        'v %f %f %f %d %d %d\n' % (pts[i, 0], pts[i, 1], pts[i, 2], color[0], color[1], color[2]))
+                    fout_gt.write('v %f %f %f %d %d %d\n' % (
+                        pts[i, 0], pts[i, 1], pts[i, 2], color_gt[0], color_gt[1], color_gt[2]))
+                fout_data_label.write('%f %f %f %d %d %d %f %d\n' % (pts[i, 0], pts[i, 1], pts[i, 2], pts[i, 3], pts[i, 4], pts[i, 5], pred_val[b, i, pred[i]], pred[i]))
+                fout_gt_label.write('%d\n' % (l[i]))
+
+    fout_data_label.close()
+    fout_gt_label.close()
+    if args.visu:
+        fout.close()
+        fout_gt.close()
+
+    _, pred = torch.max(output.data, 1)
+    pred = pred.view(-1, )
+    return target.cpu().numpy(), pred.cpu().numpy()
+
+model = get_model()
+model.cuda()
+criterion = nn.CrossEntropyLoss().cuda()
+
+if args.weight_file != '':
+    pre_trained_model = torch.load(args.weight_file)
+    model_state = model.state_dict()
+    model_state.update(pre_trained_model['state_dict'])
+    model.load_state_dict(model_state)
+
+total_correct = 0
+total_seen = 0
+fout_out_filelist = open(OUTPUT_FILELIST, 'w')
+
+cm = ConfusionMatrix(4, class_names=class_names)
+cm.clear()
+model.eval()
+
+for room_path in ROOM_PATH_LIST:
+    out_data_label_filename = os.path.basename(room_path)[:-4] + '_pred.txt'
+    out_data_label_filename = os.path.join(DUMP_DIR, out_data_label_filename)
+    out_gt_label_filename = os.path.basename(room_path)[:-4] + '_gt.txt'
+    out_gt_label_filename = os.path.join(DUMP_DIR, out_gt_label_filename)
+    print(out_data_label_filename)
+    a, b = evaluate(room_path, out_data_label_filename, out_gt_label_filename)
+    cm.add_batch(a, b)  # detach()
+    fout_out_filelist.write(out_data_label_filename + '\n')
+fout_out_filelist.close()
+# Print training results for 1 epoch
+iou0, iou1, iou2, iou3, mIoU = cm.class_IoU()
+print('Inference OA: %3.2f%%\t mIoU : %3.2f%%' % (cm.overall_accuracy(), mIoU))  # Print loss for the epoch
+print('ground: %3.2f%%, vegetation: %3.2f%%, building: %3.2f%%, clutter: %3.2f%%' % (iou0, iou1, iou2, iou3))
+
+if __name__ == '__main__':
+    print('finished!')
+
+
+
+
+from __future__ import division
+from __future__ import print_function
+
+import numpy as np
+import os
+import sys
+import argparse
+from datetime import datetime
+import h5py
+
+# from tensorboardX import SummaryWriter
+
+import torch
+import torch.nn as nn
+from torch.autograd import Variable
+
+from model.pointnet import PointNet
+from utils.train_utils import ConfusionMatrix, adjust_learning_rate, shuffle_data, getDataFiles
+
+def main():
+    parser = argparse.ArgumentParser(description='Voxelnet for semantic')
+    parser.add_argument('--lr', default=0.001, type=float, help='Initial learning rate')   # default=0.001(good)
+    parser.add_argument('--epochs', default=20, help='epochs')   # default=100, 50, 30
+    parser.add_argument('--batchsize', default=24, help='epochs')   # default=32
+    parser.add_argument('--weight_file', default='log_ptn/train/Area_2_2019-08-15-16-59-14/checkpoint/checkpoint_0_max_mIoU_test_51.07014771128727.pth.tar', help='weights to load')
+    # log_ptn/train/Area_2_2019-08-15-16-59-14/checkpoint/checkpoint_0_max_mIoU_test_51.07014771128727.pth.tar
+    parser.add_argument('--test_area', type=int, default=2, help='Which area to use for test, option: 1-2 [default: 2]')
+    parser.add_argument('--num_point', type=int, default=4096, help='Point number [default: 4096]')
+
+    args = parser.parse_args()
+    NUM_POINT = args.num_point
+    BATCH_SIZE = args.batchsize
+    lr = args.lr
+    ALL_FILES = getDataFiles('indoor3d_sem_seg_hdf5_data/all_files.txt')  # .h5 file routes
+    room_filelist = [line.rstrip() for line in open('indoor3d_sem_seg_hdf5_data/room_filelist.txt')]
+
+    # Load ALL data into a big data_batch & a big label_batch
+    data_batch_list = []
+    label_batch_list = []
+    print(ALL_FILES)
+    for h5_filename in ALL_FILES:
+        h5_dir = os.path.join('/home/zhenchao/pointnet_pytorch-master/indoor3d_sem_seg_hdf5_data',h5_filename)
+        f = h5py.File(h5_dir)
+        data_batch = f['data'][:]
+        label_batch = f['label'][:]
+
+        data_batch_list.append(data_batch)
+        label_batch_list.append(label_batch)
+    data_batches = np.concatenate(data_batch_list, 0)
+    label_batches = np.concatenate(label_batch_list, 0)
+    print(data_batches.shape)
+    print(label_batches.shape)
+
+    test_area = 'Area_' + str(args.test_area)
+    train_idxs = []
+    test_idxs = []
+    for i, room_name in enumerate(room_filelist):
+        if test_area in room_name:
+            test_idxs.append(i)
+        else:
+            train_idxs.append(i)
+
+    train_data = data_batches[train_idxs, ...]
+    train_label = label_batches[train_idxs].astype(np.int64)
+    test_data = data_batches[test_idxs, ...]
+    test_label = label_batches[test_idxs].astype(np.int64)
+    print(train_data.shape, train_label.shape)
+    print(test_data.shape, test_label.shape)
+
+
+    time_string = datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
+    log_dir = os.path.join('log_ptn/train', test_area + '_' + time_string)
+
+    if not os.path.exists(log_dir): os.makedirs(log_dir)
+
+    checkpoint_dir = os.path.join(log_dir, 'checkpoint')
+    if not os.path.exists(checkpoint_dir): os.makedirs(checkpoint_dir)
+
+
+    start_epoch = 0
+    epochs = args.epochs
+
+    model = get_model()
+    model.cuda()
+    # print(model)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr)
+
+    class_names = ["ground", "vegetation", "building", "clutter"]
+
+    # Add weights to the loss function
+    # weightsTrain = [0.04, 0.20, 0.12, 0.64]  # default
+    # weightsTrain = [0.25, 0.25, 0.25, 0.25]
+    weightsTrain = [0.20, 0.50, 0.30, 0.50]
+    class_weights_Train = torch.FloatTensor(weightsTrain).cuda()
+    criterionTrain = nn.CrossEntropyLoss(weight=class_weights_Train,
+                                         size_average=True).cuda()
+     # True: loss is averaged over each loss element in batch
+    weightsVal = [0.08, 0.37, 0.15, 0.40]    # default  [0.08, 0.37, 0.15, 0.40]
+    class_weights_Val = torch.FloatTensor(weightsVal).cuda()
+    criterionVal = nn.CrossEntropyLoss(weight=class_weights_Val,
+                                         size_average=True).cuda()
+
+    if args.weight_file != '':
+        pre_trained_model = torch.load(args.weight_file)
+        start_epoch = pre_trained_model['epoch']
+        model_state = model.state_dict()
+        model_state.update(pre_trained_model['state_dict'])
+        model.load_state_dict(model_state)
+
+
+    #  #####################################################
+    #    Start training
+    #  #####################################################
+    global_counter = 0
+    max_mIoU_test = 0.0
+
+    for epoch in range(start_epoch, epochs):
+        learn_rate_now = adjust_learning_rate(optimizer, global_counter, BATCH_SIZE, lr)  # Seems not changing, ZZC
+
+        iter_loss = 0.0  # Initialisation: loss for one epoch
+        iterations = 0
+
+        cm = ConfusionMatrix(4, class_names=class_names)
+        cm.clear()
+
+        model.train()
+
+        train_data_shuffled, train_label_shuffled, _ = shuffle_data(train_data[:, 0:NUM_POINT, :], train_label)
+        file_size = train_data_shuffled.shape[0]  # total number of training batches
+        num_batches = file_size // BATCH_SIZE  # number of iterations in one epoch
+        print('\nnum_batches(training):\t',num_batches)
+
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * BATCH_SIZE
+            end_idx = (batch_idx + 1) * BATCH_SIZE
+
+            feature = train_data_shuffled[start_idx:end_idx, :, :]
+            label = train_label_shuffled[start_idx:end_idx]
+            # print('Here')
+            # print(feature.shape)
+            # print(label.shape)
+
+            # feature[:, :, 0:2] = 0.0
+            # feature[:, :, 6:9] = 0.0
+            # print(feature.shape)
+
+            # print(feature[0, 0, 0])
+            # print(feature[0, 0, 1])
+            # print(feature[0, 0, 2])
+            # print(feature[0, 0, 3])
+            # print(feature[0, 0, 4])
+            # print(feature[0, 0, 5])
+            # print(feature[0, 0, 6])
+            # print(feature[0, 0, 7])
+            # print(feature[0, 0, 8])
+
+            #
+
+            feature = np.expand_dims(feature, axis=1)
+            input = Variable(torch.from_numpy(feature).cuda(), requires_grad=True)
+            # print(input.size())
+
+            input = torch.transpose(input, 3, 1)   # ? ZZC
+            # print(input.size())
+
+            target = Variable(torch.from_numpy(label).cuda(), requires_grad=False)
+            # print(target.size())
+
+            target = target.view(-1,)
+            # print(target.size())
+
+            output = model(input)
+            output_reshaped = output.permute(0, 3, 2, 1).contiguous().view(-1, 4)
+
+            # exit()  # for check, ZZC
+            _, pred = torch.max(output.data, 1)
+            pred = pred.view(-1,)
+            cm.add_batch(target.cpu().numpy(), pred.cpu().numpy())  # detach()
+            loss = criterionTrain(output_reshaped, target)
+            iter_loss += loss.item()  # Accumulate the loss
+            iterations +=1
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            global_counter += 1
+
+            if batch_idx%10==0:
+                print('Epoch: [%3d][%3d]\t Loss: %.4f'%(epoch,batch_idx,loss))   # Print loss for one bath
+
+        # Print training results for 1 epoch
+        iou0,iou1,iou2,iou3,mIoU = cm.class_IoU()
+        print('Epoch: [%3d]\t Train Loss: %.4f\t OA: %3.2f%%\t mIoU : %3.2f%%'%(epoch,iter_loss/iterations,cm.overall_accuracy(), mIoU))   # Print loss for the epoch
+        print('ground: %3.2f%%, vegetation: %3.2f%%, building: %3.2f%%, clutter: %3.2f%%'%(iou0,iou1,iou2,iou3))
+
+        with open(os.path.join(log_dir, 'train_log.txt'), 'a') as f:
+            f.write('Epoch: [%3d]\t Train Loss: %.4f\t OA: %3.2f%%\t mIoU : %3.2f%%\n'%(epoch,iter_loss/iterations,cm.overall_accuracy(), mIoU))
+            f.write('ground: %3.2f%%, vegetation: %3.2f%%, building: %3.2f%%, clutter: %3.2f%%\n\n'%(iou0,iou1,iou2,iou3))
+
+
+        #  #####################################################
+        #    Start validation
+        #  #####################################################
+        model.eval()
+        iter_loss = 0.0  # Initialisation: loss for one epoch
+        iterations = 0
+        cm = ConfusionMatrix(4, class_names=class_names)
+        cm.clear()
+
+        file_size = test_data.shape[0]
+        num_batches = file_size // BATCH_SIZE
+        print('num_batches(testing):\t',num_batches)
+
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * BATCH_SIZE
+            end_idx = (batch_idx + 1) * BATCH_SIZE
+            feature = test_data[start_idx:end_idx, :, :]
+            label = test_label[start_idx:end_idx]
+
+            # feature[:, :, 0:2] = 0.0
+            # feature[:, :, 6:9] = 0.0
+
+            feature = np.expand_dims(feature, axis=1)
+            input = Variable(torch.from_numpy(feature).cuda(), requires_grad=True)
+            input = torch.transpose(input, 3, 1)   # ? ZZC
+            target = Variable(torch.from_numpy(label).cuda(), requires_grad=False)
+            target = target.view(-1,)
+            output = model(input)
+            output_reshaped = output.permute(0, 3, 2, 1).contiguous().view(-1, 4)
+
+            _, pred = torch.max(output.data, 1)
+            pred = pred.view(-1,)
+            cm.add_batch(target.cpu().numpy(), pred.cpu().numpy())  # detach()
+
+            loss = criterionVal(output_reshaped, target)
+            iter_loss += loss.item()  # Accumulate the loss
+            iterations +=1
+
+        # Print validation results after 1 epoch
+        iou0, iou1, iou2, iou3, mIoU = cm.class_IoU()
+        print('Epoch: [%3d]\t Test Loss: %.4f\t OA: %3.2f%%\t mIoU : %3.2f%%'%(epoch,iter_loss/iterations,cm.overall_accuracy(), mIoU))   # Print loss for the epoch
+        print('ground: %3.2f%%, vegetation: %3.2f%%, building: %3.2f%%, clutter: %3.2f%%' % (iou0, iou1, iou2, iou3))
+
+        with open(os.path.join(log_dir, 'test_log.txt'), 'a') as f:
+            f.write('Epoch: [%3d]\t Test Loss: %.4f\t OA: %3.2f%%\t mIoU : %3.2f%%\n' % (epoch, iter_loss / iterations,cm.overall_accuracy(), mIoU))
+            f.write('ground: %3.2f%%, vegetation: %3.2f%%, building: %3.2f%%, clutter: %3.2f%%\n\n' % (iou0, iou1, iou2, iou3))
+
+        # Check whether best model, -> Save model
+        if (mIoU > max_mIoU_test or epoch == epochs - 1):
+            max_mIoU_test = mIoU
+            print('-> Best performance (test mIoU) achieved or This is final epoch.')
+            print('Max_mIoU in testing: %3.2f%%\n'%(max_mIoU_test))
+            torch.save(
+                {'epoch': epoch + 1, 'args': args, 'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict()},
+                os.path.join(checkpoint_dir, 'checkpoint_' + str(epoch) + '_max_mIoU_test_' + str(mIoU) + '.pth.tar') )
+
+
+
+def get_model():
+    model = PointNet()
+    print('Total number of parameters: {}'.format(sum([p.numel() for p in model.parameters()])))
+    return model
+
+if __name__ == '__main__':
+    main()
+
+
+
+
+
+# Write .npy numpy array data and label to h5_filename
+# Prepare .h5 files ready for training and testing
+# This code is ONLY for area 5 (with point loss)
+
+import os
+import numpy as np
+import sys
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(BASE_DIR)
+sys.path.append(BASE_DIR)
+sys.path.append(os.path.join(ROOT_DIR, 'utils'))
+import data_prep_util
+import indoor3d_util
+
+# Constants
+data_dir = os.path.join(ROOT_DIR, 'data_preparation')
+indoor3d_data_dir = os.path.join(data_dir, 's3dis_npy')
+NUM_POINT = 4096
+H5_BATCH_SIZE = 1000  # max number of batches in each .h5 file
+data_dim = [NUM_POINT, 9]
+label_dim = [NUM_POINT]
+data_dtype = 'float32'
+label_dtype = 'uint8'
+
+# Set paths
+filelist = os.path.join(BASE_DIR, 'meta/all_data_label.txt')  # .npy file routes
+data_label_files = [os.path.join(indoor3d_data_dir, line.rstrip()) for line in open(filelist)]
+print(data_label_files)
+output_dir = os.path.join(ROOT_DIR, 'indoor3d_sem_seg_hdf5_data')  # data_dir
+if not os.path.exists(output_dir):
+    os.mkdir(output_dir)
+output_filename_prefix = os.path.join(output_dir, 'ply_data_all')
+output_room_filelist = os.path.join(output_dir, 'room_filelist.txt')
+fout_room = open(output_room_filelist, 'w')
+
+# --------------------------------------
+# ----- BATCH WRITE TO HDF5 -----
+# --------------------------------------
+batch_data_dim = [H5_BATCH_SIZE] + data_dim
+batch_label_dim = [H5_BATCH_SIZE] + label_dim
+h5_batch_data = np.zeros(batch_data_dim, dtype = np.float32)
+h5_batch_label = np.zeros(batch_label_dim, dtype = np.uint8)
+buffer_size = 0  # state: record how many samples are currently in buffer
+h5_index = 0 # state: the next h5 file to save
+
+def insert_batch(data, label, last_batch=False):
+    global h5_batch_data, h5_batch_label
+    global buffer_size, h5_index
+    data_size = data.shape[0]
+    # If there is enough space, just insert
+    if buffer_size + data_size <= h5_batch_data.shape[0]:
+        h5_batch_data[buffer_size:buffer_size+data_size, ...] = data
+        h5_batch_label[buffer_size:buffer_size+data_size] = label
+        buffer_size += data_size
+    else: # not enough space
+        capacity = h5_batch_data.shape[0] - buffer_size
+        assert(capacity>=0)
+        if capacity > 0:
+           h5_batch_data[buffer_size:buffer_size+capacity, ...] = data[0:capacity, ...] 
+           h5_batch_label[buffer_size:buffer_size+capacity, ...] = label[0:capacity, ...] 
+        # Save batch data and label to h5 file, reset buffer_size
+        h5_filename =  output_filename_prefix + '_' + str(h5_index) + '.h5'
+        data_prep_util.save_h5(h5_filename, h5_batch_data, h5_batch_label, data_dtype, label_dtype) 
+        print('Stored {0} with size {1}'.format(h5_filename, h5_batch_data.shape[0]))
+        h5_index += 1
+        buffer_size = 0
+        # recursive call
+        insert_batch(data[capacity:, ...], label[capacity:, ...], last_batch)
+    if last_batch and buffer_size > 0:
+        h5_filename =  output_filename_prefix + '_' + str(h5_index) + '.h5'
+        data_prep_util.save_h5(h5_filename, h5_batch_data[0:buffer_size, ...], h5_batch_label[0:buffer_size, ...], data_dtype, label_dtype)
+        print('Stored {0} with size {1}'.format(h5_filename, buffer_size))
+        h5_index += 1
+        buffer_size = 0
+    return
+
+
+sample_cnt = 0
+for i, data_label_filename in enumerate(data_label_files):
+    print(i)
+    print(data_label_filename)
+    data, label = indoor3d_util.room2blocks_wrapper_normalized(data_label_filename, NUM_POINT, block_size=50.0, stride=50.0,
+                                                 random_sample=False, sample_num=None)
+    #  Returns:
+    #    block_datas: K x num_point x 9 np array of XYZRGB000, RGB is in [0,1]
+    #    block_labels: K x num_point x 1 np array of uint8 labels
+    #    Note that the data (X, Y) have been shifted (min point is origin) and aligned
+
+    print('{0}, {1}'.format(data.shape, label.shape))
+    for _ in range(data.shape[0]):
+        fout_room.write(os.path.basename(data_label_filename)[0:-4]+'\n')
+
+    sample_cnt += data.shape[0]
+    insert_batch(data, label, i == len(data_label_files)-1)
+
+fout_room.close()
+print("Total samples: {0}".format(sample_cnt))
+
+
+
+
+
+def room2blocks(data, label, num_point, block_size=1.0, stride=1.0,
+                random_sample=False, sample_num=None, sample_aug=1):
+    """ Prepare block training data.
+    Args:
+        data: N x 6 numpy array, 012 are XYZ in meters, 345 are RGB in [0,1]
+            Note that the data (X, Y) have been shifted (min point is origin) and aligned
+        label: N size uint8 numpy array from 0-3
+
+        num_point: int, how many points to sample in each block
+        block_size: float, physical size of the block in meters
+        stride: float, stride for block sweeping
+        random_sample: bool, if True, we will randomly sample blocks in the room
+        sample_num: int, if random sample, how many blocks to sample
+            [default: room area]
+        sample_aug: if random sample, how much aug
+
+    Returns:
+        block_datas: K x num_point x 6 np array of XYZRGB, RGB is in [0,1]
+        block_labels: K x num_point x 1 np array of uint8 labels
+
+    TODO: for this version, blocking is in fixed, non-overlapping pattern.
+    """
+    assert (stride <= block_size)
+
+    limit = np.amax(data, 0)[0:3]
+
+    # Get the corner location for our sampling blocks
+    xbeg_list = []
+    ybeg_list = []
+    if not random_sample:
+        num_block_x = int(np.ceil((limit[0] - block_size) / stride)) + 1
+        num_block_y = int(np.ceil((limit[1] - block_size) / stride)) + 1
+        for i in range(num_block_x):
+            for j in range(num_block_y):
+                xbeg_list.append(i * stride)
+                ybeg_list.append(j * stride)
+    else:
+        num_block_x = int(np.ceil(limit[0] / block_size))
+        num_block_y = int(np.ceil(limit[1] / block_size))
+        if sample_num is None:
+            sample_num = num_block_x * num_block_y * sample_aug
+        for _ in range(sample_num):
+            xbeg = np.random.uniform(-block_size, limit[0])
+            ybeg = np.random.uniform(-block_size, limit[1])
+            xbeg_list.append(xbeg)
+            ybeg_list.append(ybeg)
+
+    # Collect blocks
+    block_data_list = []
+    block_label_list = []
+    idx = 0
+    for idx in range(len(xbeg_list)):  # Iterate over each block
+        xbeg = xbeg_list[idx]
+        ybeg = ybeg_list[idx]
+        xcond = (data[:, 0] <= xbeg + block_size) & (data[:, 0] >= xbeg)
+        ycond = (data[:, 1] <= ybeg + block_size) & (data[:, 1] >= ybeg)
+        cond = xcond & ycond
+        if np.sum(cond) < 100:  # discard block if there are less than 100 pts.  # ?  ZZC
+            continue
+
+        block_data = data[cond, :]
+        block_label = label[cond]
+
+        # Normalize (x,y) in this block
+        block_data[:, 0] -= xbeg
+        block_data[:, 1] -= ybeg
+
+        # randomly subsample data
+        block_data_sampled, block_label_sampled = \
+            sample_data_label(block_data, block_label, num_point)
+        block_data_list.append(np.expand_dims(block_data_sampled, 0))
+        block_label_list.append(np.expand_dims(block_label_sampled, 0))
+
+    return np.concatenate(block_data_list, 0), \
+           np.concatenate(block_label_list, 0)
+
+
+# def room2blocks_plus(data_label, num_point, block_size, stride,
+#                      random_sample, sample_num, sample_aug):
+#     """ room2block with input filename and RGB preprocessing.
+#     """
+#     data = data_label[:, 0:6]
+#     data[:, 3:6] /= 255.0
+#     label = data_label[:, -1].astype(np.uint8)
+#
+#     return room2blocks(data, label, num_point, block_size, stride,
+#                        random_sample, sample_num, sample_aug)
+
+
+# def room2blocks_wrapper(data_label_filename, num_point, block_size=1.0, stride=1.0,
+#                         random_sample=False, sample_num=None, sample_aug=1):
+#     if data_label_filename[-3:] == 'txt':
+#         data_label = np.loadtxt(data_label_filename)
+#     elif data_label_filename[-3:] == 'npy':
+#         data_label = np.load(data_label_filename)
+#     else:
+#         print('Unknown file type! exiting.')
+#         exit()
+#     return room2blocks_plus(data_label, num_point, block_size, stride,
+#                             random_sample, sample_num, sample_aug)
+
+
+def room2blocks_plus_normalized(data_label, num_point, block_size, stride,
+                                random_sample, sample_num, sample_aug):
+    """ room2block, with input filename and RGB preprocessing.
+        for each block centralize XYZ, add normalized XYZ as 678 channels
+    """
+    data = data_label[:, 0:6]   #  the points have already been shifted -> the most negative point (x,y) is now at origin. (not Z)
+    data[:, 3:6] /= 255.0    # normalize RGB, only ONCE!
+    label = data_label[:, -1].astype(np.uint8)
+
+    data_batch, label_batch = room2blocks(data, label, num_point, block_size, stride,
+                                          random_sample, sample_num, sample_aug)
+    # data_batch (xyzrgb): x,y have been - minxy_block,  Z is true value.
+
+    new_data_batch = np.zeros((data_batch.shape[0], num_point, 9))  # [number of blocks | num_point | 9]
+
+    # max_room_x = max(data[:, 0])
+    # max_room_y = max(data[:, 1])
+    # max_room_z = max(data[:, 2])
+
+    # for b in range(data_batch.shape[0]):   # Iterate over each block (50m*50m)
+    #     new_data_batch[b, :, 6] = data_batch[b, :, 0] / max_room_x  # normalize with the maximum value in this room
+    #     new_data_batch[b, :, 7] = data_batch[b, :, 1] / max_room_y
+    #     new_data_batch[b, :, 8] = data_batch[b, :, 2] / max_room_z
+    #     minx = min(data_batch[b, :, 0])  # minX in this BLOCK (ZZC)
+    #     miny = min(data_batch[b, :, 1])
+    #     data_batch[b, :, 0] -= (minx + block_size / 2)
+    #     data_batch[b, :, 1] -= (miny + block_size / 2)
+
+    new_data_batch[:, :, 0:6] = data_batch
+    return new_data_batch, label_batch
+
+
+def room2blocks_wrapper_normalized(data_label_filename, num_point, block_size=1.0, stride=1.0,
+                                   random_sample=False, sample_num=None, sample_aug=1):
+    if data_label_filename[-3:] == 'txt':
+        data_label = np.loadtxt(data_label_filename)
+    elif data_label_filename[-3:] == 'npy':
+        data_label = np.load(data_label_filename)
+    else:
+        print('Unknown file type! exiting.')
+        exit()
+    return room2blocks_plus_normalized(data_label, num_point, block_size, stride,
+                                       random_sample, sample_num, sample_aug)
+
+
+
+
+
+
+
+
+
+
+
+
+
+def collect_point_label(anno_path, out_filename, file_format='txt'):
+    """ Convert original dataset files (txt) to data_label file (npy) (each line is XYZRGBL).
+        We aggregated all the points from each instance in the room.
+
+    Args:
+        anno_path: path to annotations. e.g. Area_1/office_2/Annotations/
+        out_filename: path to save collected points and labels (each line is XYZRGBL)
+        file_format: txt or numpy, determines what file format to save.
+    Returns:
+        None
+    Note:
+        the points are shifted before save, the most negative point is now at origin.
+    """
+    points_list = []
+
+    for f in glob.glob(os.path.join(anno_path, '*.txt')):
+        cls = os.path.basename(f).split('_')[0]
+
+        if cls not in g_classes: # note: in some room there is 'staris' class..
+            cls = 'clutter'
+
+        points = np.loadtxt(f)
+        labels = np.ones((points.shape[0], 1)) * g_class2label[cls]
+
+        if points.shape[1]==3:   # Input is XYZ,without RGB
+            rgb3col =  np.zeros((points.shape[0],3))   # ZZC, + RGB
+            points_list.append(np.concatenate([points, rgb3col, labels], 1))   # After: Nx7
+        if points.shape[1]==6:   # Input is XYZRGB
+            points_list.append(np.concatenate([points, labels], 1))     # After: Nx7
+
+    data_label = np.concatenate(points_list, 0)
+    print(data_label.shape)
+    xy_min = np.amin(data_label, axis=0)[0:2]  # minimum xy in this office/conference/WC room
+    data_label[:, 0:2] -= xy_min  # shift (X,Y) to min_coord (commented by ZZC) [the most negative point is now at origin.]
+    
+    if file_format=='txt':
+        fout = open(out_filename, 'w')
+        for i in range(data_label.shape[0]):
+            fout.write('%f %f %f %d %d %d %d\n' % \
+                          (data_label[i,0], data_label[i,1], data_label[i,2],
+                           data_label[i,3], data_label[i,4], data_label[i,5],
+                           data_label[i,6]))
+        fout.close()
+    elif file_format=='numpy':
+        np.save(out_filename, data_label)
+    else:
+        print('ERROR!! Unknown file format: %s, please use txt or numpy.' % \
+            (file_format))
+        exit()
